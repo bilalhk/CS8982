@@ -1,0 +1,371 @@
+#lang eopl
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Lexer and parser specification.
+
+(define scanner-spec-3-1
+  '((white-sp
+     (whitespace) skip)
+    (comment
+     ("%" (arbno (not #\newline))) skip)
+    (identifier
+     (letter (arbno (or letter digit "?"))) symbol)
+    (number
+     (digit (arbno digit)) number)))
+
+(define grammar-3-1
+  '((program
+     (expression)
+     a-program)
+    (expression
+     (number)
+     lit-exp)
+    (expression
+     (identifier)
+     var-exp)
+    (expression
+     (primitive "(" (separated-list expression ",") ")")
+     primapp-exp)
+    (expression
+     ("if" expression "then" expression "else" expression)
+     if-exp)
+    (expression
+     ("let" (arbno identifier "=" expression) "in" expression)
+     let-exp)
+    (expression
+     ("letrec" (arbno identifier "(" (separated-list identifier ",") ")" "=" expression) "in" expression)
+     letrec-exp)
+    (expression
+     ("proc" "(" (separated-list identifier ",") ")" expression)
+     proc-exp)
+    (expression
+     ("(" expression (arbno expression) ")")
+     app-exp)
+    (expression
+     ("set" identifier "=" expression)
+     varassign-exp)
+    (expression
+     ("begin" expression (arbno ";" expression) "end")
+     begin-exp)
+    (primitive ("+") add-prim)
+    (primitive ("-") subtract-prim)
+    (primitive ("*") mult-prim)
+    (primitive ("add1") incr-prim)
+    (primitive ("sub1") decr-prim)
+    (primitive ("equal?") equal-prim)
+    (primitive ("zero?") zero-prim)
+    (primitive ("greater?") greater-prim)
+    (primitive ("less?") less-prim)
+    (primitive ("array") array-prim)
+    (primitive ("arrayref") arrayref-prim)
+    (primitive ("arrayset") arrayset-prim)))
+
+(define scan&parse (sllgen:make-string-parser scanner-spec-3-1 grammar-3-1))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Data Representations and interfaces.
+
+(define-datatype program program?
+  (a-program (expression expression?)))
+
+(define-datatype expression expression?
+  (lit-exp (datum number?))
+  (var-exp (id symbol?))
+  (primapp-exp (prim primitive?) (rands (list-of expression?)))
+  (if-exp (test-exp expression?) (then-exp expression?) (else-exp expression?))
+  (let-exp (ids (list-of symbol?)) (rands (list-of expression?)) (body expression?))
+  (letrec-exp (proc-names (list-of symbol?)) (idss (list-of (list-of symbol?))) (bodies (list-of expression?)) (letrec-body expression?))
+  (proc-exp (ids (list-of symbol?)) (body expression?))
+  (app-exp (rator expression?) (rands (list-of expression?)))
+  (varassign-exp (id symbol?) (rhs-expression expression?))
+  (begin-exp (exp expression?) (exps (list-of expression?)))
+  (lexvar-exp (depth number?) (position number?))
+  (lexlet-exp (rands (list-of expression?)) (body expression?))
+  (lexproc-exp (body expression?))
+  (lexletrec-exp (bodies (list-of expression?)) (letrec-body expression?))
+  (lexvarassign-exp (lexvar expression?) (rhs-expression expression?)))
+
+(define-datatype primitive primitive?
+  (add-prim)
+  (subtract-prim)
+  (mult-prim)
+  (incr-prim)
+  (decr-prim)
+  (equal-prim)
+  (zero-prim)
+  (greater-prim)
+  (less-prim)
+  (array-prim)
+  (arrayref-prim)
+  (arrayset-prim))
+
+(define-datatype procval procval?
+  (closure (body expression?) (env nameless-environment?)))
+
+(define-datatype nameless-environment nameless-environment?
+  (empty-nameless-env-record)
+  (nameless-extended-env-record
+   (vals vector?)
+   (env nameless-environment?))
+  (nameless-recursively-extended-env-record (bodies (list-of expression?)) (env nameless-environment?)))
+
+(define (empty-nameless-env)
+  (empty-nameless-env-record))
+
+(define (extend-nameless-env vals env)
+  (nameless-extended-env-record vals env))
+
+(define (recursively-extend-nameless-env bodies old-env)
+  (nameless-recursively-extended-env-record bodies old-env))
+
+(define (apply-nameless-env env depth pos)
+  (deref (apply-nameless-env-ref env depth pos)))
+
+(define (apply-nameless-env-ref env depth pos)
+  (if (= depth 0)
+      (cases nameless-environment env
+        (nameless-extended-env-record (vals env) (a-ref pos vals))
+        (nameless-recursively-extended-env-record (bodies old-env) (closure (list-ref bodies pos) env))
+        (else (eopl:error 'apply-nameless-env-ref "No binding found for variable with lexical address ~d ~p" depth pos)))
+      (cases nameless-environment env
+        (nameless-extended-env-record (vals old-env) (apply-nameless-env-ref old-env (- depth 1) pos))
+        (nameless-recursively-extended-env-record (bodies old-env) (apply-nameless-env-ref old-env (- depth 1) pos))
+        (else (eopl:error 'apply-nameless-env-ref "No binding found for variable with lexical address ~d ~p" depth pos)))))
+
+(define-datatype reference reference?
+  (a-ref (position integer?) (vec vector?)))
+
+(define (primitive-deref ref)
+  (cases reference ref
+    (a-ref (pos vec) (vector-ref vec pos))))
+
+(define (primitive-setref! ref val)
+  (cases reference ref
+    (a-ref (pos vec) (vector-set! vec pos val))))
+
+(define (deref ref)
+  (primitive-deref ref))
+
+(define (setref! ref val)
+  (primitive-setref! ref val))
+
+;; Environment for storing declarations. Used for calculating lexical addresses.
+(define-datatype declarations declarations?
+  (empty-declarations)
+  (extended-declarations (current-scope (list-of symbol?)) (higher-scopes declarations?)))
+
+(define (create-lexvar-exp id decs)
+  (define (calc-address-with-depth id decs depth)
+    (cases declarations decs
+      (empty-declarations () (eopl:error 'calc-address "No declaration found for ~s" id))
+      (extended-declarations (current-scope higher-scopes)
+                             (let ((pos (list-find-position id current-scope)))
+                               (if (number? pos)
+                                   (lexvar-exp depth pos)
+                                   (calc-address-with-depth id higher-scopes (+ depth 1)))))))
+  
+  (calc-address-with-depth id decs 0))
+
+(define true-value?
+  (lambda (value)
+    (not (zero? value))))
+
+(define scheme-value? (lambda (v) #t))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Utility functions.
+
+(define (init-nameless-env)
+  (extend-nameless-env (list->vector '(1 5 10)) (empty-nameless-env)))
+
+(define (list-of pred)
+  (lambda (val)
+    (or (null? val)
+        (and (pair? val)
+             (pred (car val))
+             ((list-of pred) (cdr val))))))
+
+;; Symbol * ListOfSymbol -> Number/Boolean
+;; Returns position of Symbol in ListOfSymbol if Symbol is found. If not found, returns false.
+(define (list-find-position sym los)
+  (define (find-pos sym los)
+    (cond
+      ((eq? sym (car los)) 0)
+      (else (+ 1 (find-pos sym (cdr los))))))
+  (define (member? sym los)
+    (cond
+      ((null? los) #f)
+      (else (or (eq? sym (car los))
+                (member? sym (cdr los))))))
+  
+  (cond
+    ((not (member? sym los)) #f)
+    (else (find-pos sym los))))
+
+(define (iota upper-limit)
+  (define (generate-list n)
+    (if (>= n upper-limit)
+        '()
+        (cons n (generate-list (+ n 1)))))
+  
+  (generate-list 0))
+
+(define (run string)
+  (eval-program (lex-address-calculator  (scan&parse string))))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Evaluator
+
+(define (eval-expression exp env)
+  (cases expression exp
+    (lit-exp (datum) datum)
+    (lexvar-exp (depth pos) (apply-nameless-env env depth pos))
+    (primapp-exp (prim rands) (apply-primitive prim (eval-rands rands env)))
+    (if-exp (test-exp true-exp false-exp) (eval-if-exp test-exp true-exp false-exp env))
+    (lexlet-exp (rands body) (eval-lexlet-exp rands body env))
+    (lexproc-exp (body) (closure body env))
+    (app-exp (rator rands) (eval-app-exp rator rands env))
+    (lexletrec-exp (bodies letrec-body) (eval-expression letrec-body (recursively-extend-nameless-env bodies env)))
+    (lexvarassign-exp (lexvar rhs-expression) (eval-lexvarassign-exp lexvar rhs-expression env))
+    (begin-exp (exp exps) (eval-begin-exp exp exps env))
+    (else (eopl:error 'eval-expression "Interpreter does not understand expression ~e" exp))))
+
+(define (eval-if-exp test-exp true-exp false-exp env)
+  (if (true-value? (eval-expression test-exp env))
+      (eval-expression true-exp env)
+      (eval-expression false-exp env)))
+
+(define (eval-lexlet-exp rands body env)
+  (let* ((args (eval-rands rands env))
+         (extended-env (extend-nameless-env (list->vector args) env)))
+    (eval-expression body extended-env)))
+
+(define (eval-app-exp rator rands env)
+  (let ((proc (eval-expression rator env))
+        (args (eval-rands rands env)))
+    (if (procval? proc)
+        (apply-procval proc args)
+        (eopl:error 'app-exp-eval-expression "Attempt to apply non-procedure ~s" proc))))
+
+(define (eval-lexvarassign-exp lexvar rhs-expression env)
+  (let ((new-val (eval-expression rhs-expression env))
+        (var-ref (cases expression lexvar
+                   (lexvar-exp (depth pos)
+                               (apply-nameless-env-ref env depth pos))
+                   (else (eopl:error 'eval-expression "Interpreter does not understand lhs of set expression ~e" lexvar)))))
+    (begin (setref! var-ref new-val)
+           1)))
+
+(define (eval-begin-exp exp exps env)
+  (if (null? exps)
+      (eval-expression exp env)
+      (begin (eval-expression exp env)
+             (eval-expression (begin-exp (car exps) (cdr exps)) env))))
+
+(define (eval-rands rands env)
+  (map (lambda (x) (eval-rand x env)) rands))
+
+(define (eval-rand rand env)
+  (eval-expression rand env))
+
+(define (apply-procval proc args)
+  (cases procval proc
+    (closure (body env)
+             (let ((extended-env (extend-nameless-env (list->vector args) env)))
+               (eval-expression body extended-env)))))
+
+(define (apply-primitive prim args)
+  (cases primitive prim
+    (add-prim () (+ (car args) (cadr args)))
+    (subtract-prim () (- (car args) (cadr args)))
+    (mult-prim () (* (car args) (cadr args)))
+    (incr-prim () (+ (car args) 1))
+    (decr-prim () (- (car args) 1))
+    (equal-prim () (if (= (car args) (cadr args))
+                       1
+                       0))
+    (zero-prim () (if (zero? (car args))
+                      1
+                      0))
+    (greater-prim () (if (> (car args) (cadr args))
+                         1
+                         0))
+    (less-prim () (if (< (car args) (cadr args))
+                      1
+                      0))
+    (array-prim () (make-vector (car args) 0))
+    (arrayset-prim () (begin (vector-set! (car args) (cadr args) (caddr args))
+                             1))
+    (arrayref-prim () (vector-ref (car args) (cadr args)))))
+
+(define (eval-program pgm)
+  (cases program pgm
+    (a-program (body) (eval-expression body (init-nameless-env)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Lexical address calculator.
+
+(define (lex-address-calculator prog)
+  (cases program prog
+    (a-program (expression) (a-program (exp-lex-address-calculator expression (empty-declarations))))))
+
+(define (exp-lex-address-calculator exp declarations)
+  (cases expression exp
+    (lit-exp (datum) (lit-exp datum))
+    (var-exp (id) (create-lexvar-exp id declarations))
+    (primapp-exp (prim rands) (primapp-exp-lex-address-calculator prim rands declarations))
+    (if-exp (test-exp true-exp false-exp) (if-exp-lex-address-calculator test-exp true-exp false-exp declarations))
+    (let-exp (ids rands body) (let-exp-lex-address-calculator ids rands body declarations))
+    (letrec-exp (proc-names idss bodies letrec-body)
+                (letrec-exp-lex-address-calculator proc-names idss bodies letrec-body declarations))
+    (proc-exp (ids body) (proc-exp-lex-address-calculator ids body declarations))
+    (app-exp (rator rands) (app-exp-lex-address-calculator rator rands declarations))
+    (varassign-exp (id rhs-exp) (varassign-exp-lex-address-calculator id rhs-exp declarations))
+    (begin-exp (exp exps) (begin-exp-lex-address-calculator exp exps declarations))
+    (else exp)))
+
+(define (primapp-exp-lex-address-calculator prim rands declarations)
+  (let ((mapped-rands (map (lambda (rand) (exp-lex-address-calculator rand declarations)) rands)))
+    (primapp-exp prim mapped-rands)))
+
+(define (if-exp-lex-address-calculator test-exp true-exp false-exp declarations)
+  (let ((mapped-test-exp (exp-lex-address-calculator test-exp declarations))
+        (mapped-true-exp (exp-lex-address-calculator true-exp declarations))
+        (mapped-false-exp (exp-lex-address-calculator false-exp declarations)))
+    (if-exp mapped-test-exp mapped-true-exp mapped-false-exp)))
+
+(define (let-exp-lex-address-calculator ids rands body declarations)
+  (let* ((mapped-rands (map (lambda (rand) (exp-lex-address-calculator rand declarations)) rands))
+         (extended-decs (extended-declarations ids declarations))
+         (mapped-body (exp-lex-address-calculator body extended-decs)))
+    (lexlet-exp mapped-rands mapped-body)))
+
+(define (letrec-exp-lex-address-calculator proc-names idss bodies letrec-body declarations)
+  (let* ((indices (iota (length proc-names)))
+         (extended-decs-bodies-list (map (lambda (n)
+                                           (extended-declarations (list-ref idss n)
+                                                                  (extended-declarations proc-names declarations)))
+                                         indices))
+         (extended-decs-letrec-body (extended-declarations proc-names declarations))
+         (mapped-bodies (map (lambda (n) (exp-lex-address-calculator (list-ref bodies n) (list-ref extended-decs-bodies-list n))) indices))
+         (mapped-letrec-body (exp-lex-address-calculator letrec-body extended-decs-letrec-body)))
+    (lexletrec-exp mapped-bodies mapped-letrec-body)))
+
+(define (proc-exp-lex-address-calculator ids body declarations)
+  (let* ((extended-decs (extended-declarations ids declarations))
+         (mapped-body (exp-lex-address-calculator body extended-decs)))
+    (lexproc-exp mapped-body)))
+
+(define (app-exp-lex-address-calculator rator rands declarations)
+  (let ((mapped-rator (exp-lex-address-calculator rator declarations))
+        (mapped-rands (map (lambda (rand) (exp-lex-address-calculator rand declarations)) rands)))
+    (app-exp mapped-rator mapped-rands)))
+
+(define (varassign-exp-lex-address-calculator id rhs-exp declarations)
+  (let ((lexvar (exp-lex-address-calculator (var-exp id) declarations))
+        (mapped-rhs-exp (exp-lex-address-calculator rhs-exp declarations)))
+    (lexvarassign-exp lexvar mapped-rhs-exp)))
+
+(define (begin-exp-lex-address-calculator exp exps declarations)
+  (let ((mapped-exp (exp-lex-address-calculator exp declarations))
+        (mapped-exps (map (lambda (exp) (exp-lex-address-calculator exp declarations)) exps)))
+    (begin-exp mapped-exp mapped-exps)))
