@@ -33,10 +33,10 @@
      ("let" (arbno identifier "=" expression) "in" expression)
      let-exp)
     (expression
-     ("letrec" (arbno identifier "(" (separated-list identifier ",") ")" "=" expression) "in" expression)
+     ("letrec" (arbno type-exp identifier "(" (separated-list type-exp identifier ",") ")" "=" expression) "in" expression)
      letrec-exp)
     (expression
-     ("proc" "(" (separated-list identifier ",") ")" expression)
+     ("proc" "(" (separated-list type-exp identifier ",") ")" expression)
      proc-exp)
     (expression
      ("(" expression (arbno expression) ")")
@@ -47,6 +47,13 @@
     (expression
      ("begin" expression (arbno ";" expression) "end")
      begin-exp)
+    (expression ("true") true-exp)
+    (expression ("false") false-exp)
+    (type-exp ("int") int-type-exp)
+    (type-exp ("bool") bool-type-exp)
+    (type-exp
+     ("(" (separated-list type-exp "*") "->" type-exp ")")
+     proc-type-exp)
     (primitive ("+") add-prim)
     (primitive ("-") subtract-prim)
     (primitive ("*") mult-prim)
@@ -74,16 +81,28 @@
   (primapp-exp (prim primitive?) (rands (list-of expression?)))
   (if-exp (test-exp expression?) (then-exp expression?) (else-exp expression?))
   (let-exp (ids (list-of symbol?)) (rands (list-of expression?)) (body expression?))
-  (letrec-exp (proc-names (list-of symbol?)) (idss (list-of (list-of symbol?))) (bodies (list-of expression?)) (letrec-body expression?))
-  (proc-exp (ids (list-of symbol?)) (body expression?))
+  (letrec-exp (result-texps (list-of type-exp?))
+              (proc-names (list-of symbol?))          
+              (texpss (list-of (list-of type-exp?)))
+              (idss (list-of (list-of symbol?)))
+              (bodies (list-of expression?))
+              (letrec-body expression?))
+  (proc-exp (arg-texps (list-of type-exp?)) (ids (list-of symbol?)) (body expression?))
   (app-exp (rator expression?) (rands (list-of expression?)))
   (varassign-exp (id symbol?) (rhs-expression expression?))
   (begin-exp (exp expression?) (exps (list-of expression?)))
+  (true-exp)
+  (false-exp)
   (lexvar-exp (depth number?) (position number?))
   (lexlet-exp (rands (list-of expression?)) (body expression?))
   (lexproc-exp (body expression?))
   (lexletrec-exp (bodies (list-of expression?)) (letrec-body expression?))
   (lexvarassign-exp (lexvar expression?) (rhs-expression expression?)))
+
+(define-datatype type-exp type-exp?
+  (int-type-exp)
+  (bool-type-exp)
+  (proc-type-exp (arg-texps (list-of type-exp?)) (result-texps type-exp?)))
 
 (define-datatype primitive primitive?
   (add-prim)
@@ -165,6 +184,33 @@
                                    (calc-address-with-depth id higher-scopes (+ depth 1)))))))
   
   (calc-address-with-depth id decs 0))
+
+(define-datatype type type?
+  (atomic-type (name symbol?))
+  (proc-type (arg-types (list-of type?)) (result-type type?)))
+
+(define int-type (atomic-type 'int))
+(define bool-type (atomic-type 'bool))
+(define array-type (atomic-type 'array))
+
+;; Environment for storing types. Used for checking the type of an expression.
+(define-datatype type-environment type-environment?
+  (empty-type-environment)
+  (extended-type-environment (ids (list-of symbol?)) (types (list-of type?)) (old-tenv type-environment?)))
+
+;; ListOf(Symbol) * ListOf(Type) * Type-environment -> Type-environment
+(define (extend-tenv ids types old-tenv)
+  (extended-type-environment ids types old-tenv))
+
+;; Symbol * Type-environment -> Type
+(define (apply-tenv id tenv)
+  (cases type-environment tenv
+    (empty-type-environment () (eopl:error 'apply-tenv "Variable with id ~s not found in type-environment ~s" id tenv))
+    (extended-type-environment (ids types old-tenv)
+                               (let ((pos (list-find-position id ids)))
+                                 (if (number? pos)
+                                     (list-ref types pos)
+                                     (apply-tenv id old-tenv))))))
 
 (define true-value?
   (lambda (value)
@@ -315,9 +361,9 @@
     (primapp-exp (prim rands) (primapp-exp-lex-address-calculator prim rands declarations))
     (if-exp (test-exp true-exp false-exp) (if-exp-lex-address-calculator test-exp true-exp false-exp declarations))
     (let-exp (ids rands body) (let-exp-lex-address-calculator ids rands body declarations))
-    (letrec-exp (proc-names idss bodies letrec-body)
+    (letrec-exp (result-texps proc-names texpss idss bodies letrec-body)
                 (letrec-exp-lex-address-calculator proc-names idss bodies letrec-body declarations))
-    (proc-exp (ids body) (proc-exp-lex-address-calculator ids body declarations))
+    (proc-exp (arg-texps ids body) (proc-exp-lex-address-calculator ids body declarations))
     (app-exp (rator rands) (app-exp-lex-address-calculator rator rands declarations))
     (varassign-exp (id rhs-exp) (varassign-exp-lex-address-calculator id rhs-exp declarations))
     (begin-exp (exp exps) (begin-exp-lex-address-calculator exp exps declarations))
@@ -369,3 +415,146 @@
   (let ((mapped-exp (exp-lex-address-calculator exp declarations))
         (mapped-exps (map (lambda (exp) (exp-lex-address-calculator exp declarations)) exps)))
     (begin-exp mapped-exp mapped-exps)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Type checker
+
+;; Type-exp -> Type
+(define (expand-type-expression texp)
+  (cases type-exp texp
+    (int-type-exp () int-type)
+    (bool-type-exp () bool-type)
+    (proc-type-exp (arg-texps result-texp)
+                   (proc-type (expand-type-expressions arg-texps) (expand-type-expression result-texp)))))
+
+;; ListOf(Type-exp) -> ListOf(Type)
+(define (expand-type-expressions texps)
+  (map expand-type-expression texps))
+
+;; Type * Type * Expression -> Boolean/none
+(define (check-equal-type! type1 type2 exp)
+  (if (not (equal? type1 type2))
+      (eopl:error 'check-equal-type!
+                  "Types didn't match: ~s != ~s in ~%~s"
+                  (type-to-external-form type1)
+                  (type-to-external-form type2)
+                  exp)
+      #t))
+
+(define (type-to-external-form ty)
+  (cases type ty
+    (atomic-type (name) name)
+    (proc-type (arg-types result-type)
+               (append (arg-types-to-external-form arg-types)
+                       '(->)
+                       (type-to-external-form result-type)))))
+
+(define (arg-types-to-external-form arg-types)
+  (if (null? arg-types)
+      '()
+      (cons (type-to-external-form (car arg-types)) (arg-types-to-external-form (cdr arg-types)))))
+
+(define (type-check prog)
+  (cases program prog
+    (a-program (exp) (type-of-expression exp (empty-type-environment)))))
+
+;; Expression * Type-environment -> Type
+(define (type-of-expression exp tenv)
+  (cases expression exp
+    (lit-exp (number) int-type)
+    (true-exp () bool-type)
+    (false-exp () bool-type)
+    (var-exp (id) (apply-tenv id tenv))
+    (if-exp (test-exp true-exp false-exp) (type-of-if-exp test-exp true-exp false-exp tenv))
+    (proc-exp (arg-texps ids body) (type-of-proc-exp arg-texps ids body tenv))
+    (primapp-exp (prim rands)
+                 (type-of-application (type-of-primitive prim) (types-of-expressions rands tenv) prim rands exp))
+    (app-exp (rator rands)
+             (type-of-application (type-of-expression rator tenv) (types-of-expressions rands tenv) rator rands exp))
+    (let-exp (ids rands body) (type-of-let-exp ids rands body tenv))
+    (letrec-exp (result-texps proc-names arg-texpss idss bodies letrec-body)
+                (type-of-letrec-exp result-texps proc-names arg-texpss idss bodies letrec-body tenv))
+    (begin-exp (exp exps) (type-of-begin-exp exp exps tenv))
+    (varassign-exp (id rhs-expression) int-type)
+    (else (eopl:error 'type-of-expression "Type-checker does not undertand expression ~s" exp))))
+
+;; Lof(Expression) * Type-environment -> Lof(Type)
+(define (types-of-expressions rands tenv)
+  (map (lambda (rand) (type-of-expression rand tenv)) rands))
+
+;; Lof(Symbol) * Lof(Expression) * Expression * Type-environment -> Type
+(define (type-of-let-exp ids rands body tenv)
+  (let* ((rand-types (map (lambda (rand) (type-of-expression rand tenv)) rands))
+         (tenv-for-body (extend-tenv ids rand-types tenv)))
+    (type-of-expression body tenv-for-body)))
+
+;; Expression * Lof(Expression) * Type-environment -> Type
+(define (type-of-begin-exp exp exps tenv)
+  (if (null? exps)
+      (type-of-expression exp tenv)
+      (type-of-begin-exp (car exps) (cdr exps) tenv)))
+
+;; Expression * Expression * Expression * Type-environment -> Type
+(define (type-of-if-exp test-exp true-exp false-exp tenv)
+  (let ((test-type (type-of-expression test-exp tenv))
+        (true-type (type-of-expression true-exp tenv))
+        (false-type (type-of-expression false-exp tenv)))
+    (begin (check-equal-type! test-type bool-type test-exp)
+           (check-equal-type! true-type false-type (if-exp test-exp true-exp false-exp))
+           true-type)))
+
+;; ListOf(Type-exp) * ListOf(Symbol) * Expression * Type-environment -> Type
+(define (type-of-proc-exp arg-texps ids body tenv)
+  (let* ((arg-types (expand-type-expressions arg-texps))
+         (extended-tenv (extend-tenv ids arg-types tenv))
+         (result-type (type-of-expression body extended-tenv)))
+    (proc-type arg-types result-type)))
+
+;; Type * ListOf(Types) * Expression * ListOf(Expression) * Expression -> Type
+(define (type-of-application rator-type rand-types rator rands exp)
+  (cases type rator-type
+    (proc-type (arg-types result-type)
+               (if (= (length arg-types) (length rand-types))
+                   (begin (for-each check-equal-type! rand-types arg-types rands)
+                          result-type)
+                   (eopl:error 'type-of-expression
+                               "Wrong number of arguments in expression ~s: ~%expected ~s~%got ~s"
+                               exp
+                               (map type-to-external-form arg-types)
+                               (map type-to-external-form rand-types))))
+    (else (eopl:error 'type-of-expression
+                      "Rator not a proc type:~s~%had rator type ~s"
+                      rator
+                      (type-to-external-form rator-type)))))
+
+;; Primitive -> Type
+(define (type-of-primitive prim)
+  (cases primitive prim
+    (add-prim () (proc-type (list int-type int-type) int-type))
+    (subtract-prim () (proc-type (list int-type int-type) int-type))
+    (mult-prim () (proc-type (list int-type int-type) int-type))
+    (incr-prim () (proc-type (list int-type) int-type))
+    (decr-prim () (proc-type (list int-type) int-type))
+    (equal-prim () (proc-type (list int-type int-type) bool-type))
+    (zero-prim () (proc-type (list int-type) bool-type))
+    (greater-prim () (proc-type (list int-type int-type) bool-type))
+    (less-prim () (proc-type (list int-type int-type) bool-type))
+    (array-prim () (proc-type (list int-type) array-type))
+    (arrayref-prim () (proc-type (list array-type int-type) int-type))
+    (arrayset-prim () (proc-type (list array-type int-type int-type) int-type))))
+
+;; Lof(Type-exp) * Lof(Symbol) * Lof(Lof(Type-exp)) * Lof(Lof(Symbol)) * Lof(Expression) * Expression * Type-environment -> Type
+(define (type-of-letrec-exp result-texps proc-names arg-texpss idss bodies letrec-body tenv)
+  (let* ((result-types (expand-type-expressions result-texps))
+         (arg-typess (map expand-type-expressions arg-texpss))
+         (proc-types (map proc-type arg-typess result-types))
+         (tenv-for-letrec-body (extend-tenv proc-names proc-types tenv))
+         (tenvs-for-proc-bodies (map (lambda (ids arg-types) (extend-tenv ids arg-types tenv-for-letrec-body))
+                                     idss
+                                     arg-typess))
+         (proc-body-types (map (lambda (body tenv) (type-of-expression body tenv)) bodies tenvs-for-proc-bodies)))
+    (begin (for-each (lambda (result-type proc-body-type body) (check-equal-type! result-type proc-body-type body))
+                     result-types
+                     proc-body-types
+                     bodies)
+           (type-of-expression letrec-body tenv-for-letrec-body))))
