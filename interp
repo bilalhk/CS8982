@@ -26,6 +26,9 @@
     (expression
      (primitive "(" (separated-list expression ",") ")")
      primapp-exp)
+    (expression ("array" "(" type-exp "," expression ")") arrayapp-exp)
+    (expression ("arrayref" "(" expression "," expression ")") arrayref-exp)
+    (expression ("arrayset" "(" expression "," expression "," expression ")") arrayset-exp)
     (expression
      ("if" expression "then" expression "else" expression)
      if-exp)
@@ -54,6 +57,7 @@
     (type-exp
      ("(" (separated-list type-exp "*") "->" type-exp ")")
      proc-type-exp)
+    (type-exp ("arr" "[" type-exp "]") array-type-exp)
     (primitive ("+") add-prim)
     (primitive ("-") subtract-prim)
     (primitive ("*") mult-prim)
@@ -62,10 +66,7 @@
     (primitive ("equal?") equal-prim)
     (primitive ("zero?") zero-prim)
     (primitive ("greater?") greater-prim)
-    (primitive ("less?") less-prim)
-    (primitive ("array") array-prim)
-    (primitive ("arrayref") arrayref-prim)
-    (primitive ("arrayset") arrayset-prim)))
+    (primitive ("less?") less-prim)))
 
 (define scan&parse (sllgen:make-string-parser scanner-spec-3-1 grammar-3-1))
 
@@ -79,6 +80,9 @@
   (lit-exp (datum number?))
   (var-exp (id symbol?))
   (primapp-exp (prim primitive?) (rands (list-of expression?)))
+  (arrayapp-exp (texp type-exp?) (size expression?))
+  (arrayref-exp (array-exp expression?) (index-exp expression?))
+  (arrayset-exp (array-exp expression?) (index-exp expression?) (val-exp expression?))
   (if-exp (test-exp expression?) (then-exp expression?) (else-exp expression?))
   (let-exp (ids (list-of symbol?)) (rands (list-of expression?)) (body expression?))
   (letrec-exp (result-texps (list-of type-exp?))
@@ -102,7 +106,8 @@
 (define-datatype type-exp type-exp?
   (int-type-exp)
   (bool-type-exp)
-  (proc-type-exp (arg-texps (list-of type-exp?)) (result-texps type-exp?)))
+  (proc-type-exp (arg-texps (list-of type-exp?)) (result-texps type-exp?))
+  (array-type-exp (texp type-exp?)))
 
 (define-datatype primitive primitive?
   (add-prim)
@@ -113,10 +118,7 @@
   (equal-prim)
   (zero-prim)
   (greater-prim)
-  (less-prim)
-  (array-prim)
-  (arrayref-prim)
-  (arrayset-prim))
+  (less-prim))
 
 (define-datatype procval procval?
   (closure (body expression?) (env nameless-environment?)))
@@ -187,11 +189,11 @@
 
 (define-datatype type type?
   (atomic-type (name symbol?))
-  (proc-type (arg-types (list-of type?)) (result-type type?)))
+  (proc-type (arg-types (list-of type?)) (result-type type?))
+  (array-type (type type?)))
 
 (define int-type (atomic-type 'int))
 (define bool-type (atomic-type 'bool))
-(define array-type (atomic-type 'array))
 
 ;; Environment for storing types. Used for checking the type of an expression.
 (define-datatype type-environment type-environment?
@@ -266,6 +268,9 @@
     (lit-exp (datum) datum)
     (lexvar-exp (depth pos) (apply-nameless-env env depth pos))
     (primapp-exp (prim rands) (apply-primitive prim (eval-rands rands env)))
+    (arrayapp-exp (type-exp size-exp) (apply-arrayapp-exp size-exp env))
+    (arrayref-exp (array-exp index-exp) (apply-arrayref-exp array-exp index-exp env))
+    (arrayset-exp (array-exp index-exp val-exp) (apply-arrayset-exp array-exp index-exp val-exp env))
     (if-exp (test-exp true-exp false-exp) (eval-if-exp test-exp true-exp false-exp env))
     (lexlet-exp (rands body) (eval-lexlet-exp rands body env))
     (lexproc-exp (body) (closure body env))
@@ -274,6 +279,22 @@
     (lexvarassign-exp (lexvar rhs-expression) (eval-lexvarassign-exp lexvar rhs-expression env))
     (begin-exp (exp exps) (eval-begin-exp exp exps env))
     (else (eopl:error 'eval-expression "Interpreter does not understand expression ~e" exp))))
+
+(define (apply-arrayapp-exp size-exp env)
+  (let ((size (eval-expression size-exp env)))
+    (make-vector size)))
+
+(define (apply-arrayref-exp array-exp index-exp env)
+  (let ((array (eval-expression array-exp env))
+        (index (eval-expression index-exp env)))
+    (vector-ref array index)))
+
+(define (apply-arrayset-exp array-exp index-exp val-exp env)
+  (let ((array (eval-expression array-exp env))
+        (index (eval-expression index-exp env))
+        (val (eval-expression val-exp env)))
+    (begin (vector-set! array index val)
+           1)))
 
 (define (eval-if-exp test-exp true-exp false-exp env)
   (if (true-value? (eval-expression test-exp env))
@@ -337,11 +358,7 @@
                          0))
     (less-prim () (if (< (car args) (cadr args))
                       1
-                      0))
-    (array-prim () (make-vector (car args) 0))
-    (arrayset-prim () (begin (vector-set! (car args) (cadr args) (caddr args))
-                             1))
-    (arrayref-prim () (vector-ref (car args) (cadr args)))))
+                      0))))
 
 (define (eval-program pgm)
   (cases program pgm
@@ -359,6 +376,9 @@
     (lit-exp (datum) (lit-exp datum))
     (var-exp (id) (create-lexvar-exp id declarations))
     (primapp-exp (prim rands) (primapp-exp-lex-address-calculator prim rands declarations))
+    (arrayapp-exp (type-exp size-exp) (arrayapp-exp-lex-address-calculator type-exp size-exp declarations))
+    (arrayref-exp (array-exp index-exp) (arrayref-exp-lex-address-calculator array-exp index-exp declarations))
+    (arrayset-exp (array-exp index-exp val-exp) (arrayset-exp-lex-address-calculator array-exp index-exp val-exp declarations))
     (if-exp (test-exp true-exp false-exp) (if-exp-lex-address-calculator test-exp true-exp false-exp declarations))
     (let-exp (ids rands body) (let-exp-lex-address-calculator ids rands body declarations))
     (letrec-exp (result-texps proc-names texpss idss bodies letrec-body)
@@ -368,6 +388,21 @@
     (varassign-exp (id rhs-exp) (varassign-exp-lex-address-calculator id rhs-exp declarations))
     (begin-exp (exp exps) (begin-exp-lex-address-calculator exp exps declarations))
     (else exp)))
+
+(define (arrayapp-exp-lex-address-calculator type-exp size-exp declarations)
+  (let ((mapped-size-exp (exp-lex-address-calculator size-exp declarations)))
+    (arrayapp-exp type-exp mapped-size-exp)))
+
+(define (arrayset-exp-lex-address-calculator array-exp index-exp val-exp declarations)
+  (let ((mapped-array-exp (exp-lex-address-calculator array-exp declarations))
+        (mapped-index-exp (exp-lex-address-calculator index-exp declarations))
+        (mapped-val-exp (exp-lex-address-calculator val-exp declarations)))
+    (arrayset-exp mapped-array-exp mapped-index-exp mapped-val-exp)))
+
+(define (arrayref-exp-lex-address-calculator array-exp index-exp declarations)
+  (let ((mapped-array-exp (exp-lex-address-calculator array-exp declarations))
+        (mapped-index-exp (exp-lex-address-calculator index-exp declarations)))
+    (arrayref-exp mapped-array-exp mapped-index-exp)))
 
 (define (primapp-exp-lex-address-calculator prim rands declarations)
   (let ((mapped-rands (map (lambda (rand) (exp-lex-address-calculator rand declarations)) rands)))
@@ -425,7 +460,8 @@
     (int-type-exp () int-type)
     (bool-type-exp () bool-type)
     (proc-type-exp (arg-texps result-texp)
-                   (proc-type (expand-type-expressions arg-texps) (expand-type-expression result-texp)))))
+                   (proc-type (expand-type-expressions arg-texps) (expand-type-expression result-texp)))
+    (array-type-exp (texp) (array-type (expand-type-expression texp)))))
 
 ;; ListOf(Type-exp) -> ListOf(Type)
 (define (expand-type-expressions texps)
@@ -447,12 +483,27 @@
     (proc-type (arg-types result-type)
                (append (arg-types-to-external-form arg-types)
                        '(->)
-                       (type-to-external-form result-type)))))
+                       (type-to-external-form result-type)))
+    (array-type (type) (append (list '\[)
+                               (list (type-to-external-form type))
+                               (list '\])))))
 
 (define (arg-types-to-external-form arg-types)
   (if (null? arg-types)
       '()
       (cons (type-to-external-form (car arg-types)) (arg-types-to-external-form (cdr arg-types)))))
+
+;; Type -> Boolean
+(define (array? ty)
+  (cases type ty
+    (array-type (type) #t)
+    (else #f)))
+
+;; Type -> Boolean
+(define (int? ty)
+  (cases type ty
+    (atomic-type (name) (equal? name 'int))
+    (else #f)))
 
 (define (type-check prog)
   (cases program prog
@@ -469,6 +520,9 @@
     (proc-exp (arg-texps ids body) (type-of-proc-exp arg-texps ids body tenv))
     (primapp-exp (prim rands)
                  (type-of-application (type-of-primitive prim) (types-of-expressions rands tenv) prim rands exp))
+    (arrayapp-exp (texp size-exp) (type-of-arrayapp-exp texp size-exp tenv))
+    (arrayref-exp (array-exp index-exp) (type-of-arrayref-exp array-exp index-exp tenv))
+    (arrayset-exp (array-exp index-exp val-exp) (type-of-arrayset-exp array-exp index-exp val-exp tenv))
     (app-exp (rator rands)
              (type-of-application (type-of-expression rator tenv) (types-of-expressions rands tenv) rator rands exp))
     (let-exp (ids rands body) (type-of-let-exp ids rands body tenv))
@@ -482,6 +536,47 @@
 (define (types-of-expressions rands tenv)
   (map (lambda (rand) (type-of-expression rand tenv)) rands))
 
+;; Type-exp * Expression * Type-environment -> Type
+(define (type-of-arrayapp-exp texp size-exp tenv)
+  (let ((size-type (type-of-expression size-exp tenv))
+        (arr-type (expand-type-expression texp)))
+    (if (int? size-type)
+        (array-type arr-type)
+        (eopl:error 'type-of-expression
+                    "Expected Int as second argument to expression ~s. Received ~s"
+                    (arrayapp-exp texp size-exp)
+                    size-type))))
+
+
+;; Expression * Expression * Type-environment -> Type
+(define (type-of-arrayref-exp array-exp index-exp tenv)
+  (let ((array-exp-type (type-of-expression array-exp tenv))
+        (index-exp-type (type-of-expression index-exp tenv)))
+    (if (and (array? array-exp-type) (int? index-exp-type))
+        (cases type array-exp-type
+          (array-type (type) type)
+          (else (eopl:error 'type-of-expression "Interpreter does not understand Type ~s" array-exp-type)))
+        (eopl:error 'type-of-expression
+                    "Incorrect argument types for arrayref. Expected an Array and an Int. Received ~s and ~s"
+                    array-exp-type
+                    index-exp-type))))
+
+;; Expression * Expression * Expression * Type-environment -> Type
+(define (type-of-arrayset-exp array-exp index-exp val-exp tenv)
+  (define (check-array-and-val! array-exp-type val-exp-type)
+    (cases type array-exp-type
+      (array-type (type) (check-equal-type! type val-exp-type (arrayset-exp array-exp index-exp val-exp)))
+      (else (eopl:error 'type-of-expression
+                        "Expected an array as first argument. Instead got ~s"
+                        array-exp-type))))
+
+  (let ((array-exp-type (type-of-expression array-exp tenv))
+        (index-exp-type (type-of-expression index-exp tenv))
+        (val-exp-type (type-of-expression val-exp tenv)))
+    (begin (check-equal-type! index-exp-type int-type (arrayset-exp array-exp index-exp val-exp))
+           (check-array-and-val! array-exp-type val-exp-type)
+           val-exp-type)))
+
 ;; Lof(Symbol) * Lof(Expression) * Expression * Type-environment -> Type
 (define (type-of-let-exp ids rands body tenv)
   (let* ((rand-types (map (lambda (rand) (type-of-expression rand tenv)) rands))
@@ -492,7 +587,8 @@
 (define (type-of-begin-exp exp exps tenv)
   (if (null? exps)
       (type-of-expression exp tenv)
-      (type-of-begin-exp (car exps) (cdr exps) tenv)))
+      (begin (type-of-expression exp tenv)
+             (type-of-begin-exp (car exps) (cdr exps) tenv))))
 
 ;; Expression * Expression * Expression * Type-environment -> Type
 (define (type-of-if-exp test-exp true-exp false-exp tenv)
@@ -538,10 +634,7 @@
     (equal-prim () (proc-type (list int-type int-type) bool-type))
     (zero-prim () (proc-type (list int-type) bool-type))
     (greater-prim () (proc-type (list int-type int-type) bool-type))
-    (less-prim () (proc-type (list int-type int-type) bool-type))
-    (array-prim () (proc-type (list int-type) array-type))
-    (arrayref-prim () (proc-type (list array-type int-type) int-type))
-    (arrayset-prim () (proc-type (list array-type int-type int-type) int-type))))
+    (less-prim () (proc-type (list int-type int-type) bool-type))))
 
 ;; Lof(Type-exp) * Lof(Symbol) * Lof(Lof(Type-exp)) * Lof(Lof(Symbol)) * Lof(Expression) * Expression * Type-environment -> Type
 (define (type-of-letrec-exp result-texps proc-names arg-texpss idss bodies letrec-body tenv)
